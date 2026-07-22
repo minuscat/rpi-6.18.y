@@ -526,9 +526,9 @@ static inline int qdisc_qlen_sum(const struct Qdisc *q)
 
 	if (qdisc_is_percpu_stats(q)) {
 		for_each_possible_cpu(i)
-			qlen += per_cpu_ptr(q->cpu_qstats, i)->qlen;
+			qlen += READ_ONCE(per_cpu_ptr(q->cpu_qstats, i)->qlen);
 	} else {
-		qlen += q->q.qlen;
+		qlen += READ_ONCE(q->q.qlen);
 	}
 
 	return qlen;
@@ -925,10 +925,15 @@ static inline void qdisc_bstats_update(struct Qdisc *sch,
 	bstats_update(&sch->bstats, skb);
 }
 
+static inline void qstats_backlog_sub(struct Qdisc *sch, u32 val)
+{
+	WRITE_ONCE(sch->qstats.backlog, sch->qstats.backlog - val);
+}
+
 static inline void qdisc_qstats_backlog_dec(struct Qdisc *sch,
 					    const struct sk_buff *skb)
 {
-	sch->qstats.backlog -= qdisc_pkt_len(skb);
+	qstats_backlog_sub(sch, qdisc_pkt_len(skb));
 }
 
 static inline void qdisc_qstats_cpu_backlog_dec(struct Qdisc *sch,
@@ -937,10 +942,15 @@ static inline void qdisc_qstats_cpu_backlog_dec(struct Qdisc *sch,
 	this_cpu_sub(sch->cpu_qstats->backlog, qdisc_pkt_len(skb));
 }
 
+static inline void qstats_backlog_add(struct Qdisc *sch, u32 val)
+{
+	WRITE_ONCE(sch->qstats.backlog, sch->qstats.backlog + val);
+}
+
 static inline void qdisc_qstats_backlog_inc(struct Qdisc *sch,
 					    const struct sk_buff *skb)
 {
-	sch->qstats.backlog += qdisc_pkt_len(skb);
+	qstats_backlog_add(sch, qdisc_pkt_len(skb));
 }
 
 static inline void qdisc_qstats_cpu_backlog_inc(struct Qdisc *sch,
@@ -966,12 +976,12 @@ static inline void qdisc_qstats_cpu_requeues_inc(struct Qdisc *sch)
 
 static inline void __qdisc_qstats_drop(struct Qdisc *sch, int count)
 {
-	sch->qstats.drops += count;
+	WRITE_ONCE(sch->qstats.drops, sch->qstats.drops + count);
 }
 
 static inline void qstats_drop_inc(struct gnet_stats_queue *qstats)
 {
-	qstats->drops++;
+	WRITE_ONCE(qstats->drops, qstats->drops + 1);
 }
 
 static inline void qstats_overlimit_inc(struct gnet_stats_queue *qstats)
@@ -991,7 +1001,7 @@ static inline void qdisc_qstats_cpu_drop(struct Qdisc *sch)
 
 static inline void qdisc_qstats_overlimit(struct Qdisc *sch)
 {
-	sch->qstats.overlimits++;
+	WRITE_ONCE(sch->qstats.overlimits, sch->qstats.overlimits + 1);
 }
 
 static inline int qdisc_qstats_copy(struct gnet_dump *d, struct Qdisc *sch)
@@ -1007,7 +1017,7 @@ static inline void qdisc_qstats_qlen_backlog(struct Qdisc *sch,  __u32 *qlen,
 	struct gnet_stats_queue qstats = { 0 };
 
 	gnet_stats_add_queue(&qstats, sch->cpu_qstats, &sch->qstats);
-	*qlen = qstats.qlen + qdisc_qlen(sch);
+	*qlen = qstats.qlen + READ_ONCE(sch->q.qlen);
 	*backlog = qstats.backlog;
 }
 
@@ -1033,7 +1043,7 @@ static inline void __qdisc_enqueue_tail(struct sk_buff *skb,
 		qh->tail = skb;
 		qh->head = skb;
 	}
-	qh->qlen++;
+	WRITE_ONCE(qh->qlen, qh->qlen + 1);
 }
 
 static inline int qdisc_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch)
@@ -1051,7 +1061,7 @@ static inline void __qdisc_enqueue_head(struct sk_buff *skb,
 	if (!qh->head)
 		qh->tail = skb;
 	qh->head = skb;
-	qh->qlen++;
+	WRITE_ONCE(qh->qlen, qh->qlen + 1);
 }
 
 static inline struct sk_buff *__qdisc_dequeue_head(struct qdisc_skb_head *qh)
@@ -1060,7 +1070,7 @@ static inline struct sk_buff *__qdisc_dequeue_head(struct qdisc_skb_head *qh)
 
 	if (likely(skb != NULL)) {
 		qh->head = skb->next;
-		qh->qlen--;
+		WRITE_ONCE(qh->qlen, qh->qlen - 1);
 		if (qh->head == NULL)
 			qh->tail = NULL;
 		skb->next = NULL;
@@ -1075,7 +1085,7 @@ static inline struct sk_buff *qdisc_dequeue_internal(struct Qdisc *sch, bool dir
 
 	skb = __skb_dequeue(&sch->gso_skb);
 	if (skb) {
-		sch->q.qlen--;
+		WRITE_ONCE(sch->q.qlen, sch->q.qlen - 1);
 		qdisc_qstats_backlog_dec(sch, skb);
 		return skb;
 	}
@@ -1188,7 +1198,7 @@ static inline struct sk_buff *qdisc_peek_dequeued(struct Qdisc *sch)
 			__skb_queue_head(&sch->gso_skb, skb);
 			/* it's still part of the queue */
 			qdisc_qstats_backlog_inc(sch, skb);
-			sch->q.qlen++;
+			WRITE_ONCE(sch->q.qlen, sch->q.qlen + 1);
 		}
 	}
 
@@ -1205,7 +1215,7 @@ static inline void qdisc_update_stats_at_dequeue(struct Qdisc *sch,
 	} else {
 		qdisc_qstats_backlog_dec(sch, skb);
 		qdisc_bstats_update(sch, skb);
-		sch->q.qlen--;
+		WRITE_ONCE(sch->q.qlen, sch->q.qlen - 1);
 	}
 }
 
@@ -1216,8 +1226,8 @@ static inline void qdisc_update_stats_at_enqueue(struct Qdisc *sch,
 		qdisc_qstats_cpu_qlen_inc(sch);
 		this_cpu_add(sch->cpu_qstats->backlog, pkt_len);
 	} else {
-		sch->qstats.backlog += pkt_len;
-		sch->q.qlen++;
+		qstats_backlog_add(sch, pkt_len);
+		WRITE_ONCE(sch->q.qlen, sch->q.qlen + 1);
 	}
 }
 
@@ -1233,7 +1243,7 @@ static inline struct sk_buff *qdisc_dequeue_peeked(struct Qdisc *sch)
 			qdisc_qstats_cpu_qlen_dec(sch);
 		} else {
 			qdisc_qstats_backlog_dec(sch, skb);
-			sch->q.qlen--;
+			WRITE_ONCE(sch->q.qlen, sch->q.qlen - 1);
 		}
 	} else {
 		skb = sch->dequeue(sch);
@@ -1254,7 +1264,7 @@ static inline void __qdisc_reset_queue(struct qdisc_skb_head *qh)
 
 		qh->head = NULL;
 		qh->tail = NULL;
-		qh->qlen = 0;
+		WRITE_ONCE(qh->qlen, 0);
 	}
 }
 
